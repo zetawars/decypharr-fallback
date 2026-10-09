@@ -3,7 +3,7 @@
 # host to "decypharr-fallback" and port to 8283. Nothing else changes.
 services:
   decypharr-fallback:
-    build: https://github.com/zetawars/decypharr-fallback.git
+    image: ghcr.io/zetawars/decypharr-fallback:latest
     container_name: decypharr-fallback
     environment:
       DECYPHARR_URL: http://decypharr:8282

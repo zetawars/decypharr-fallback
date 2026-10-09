@@ -92,6 +92,7 @@ class QBit:
 
 
 qbit = QBit()
+seen_working = set()  # Decypharr hashes observed in a non-error state since startup
 
 
 def rewrite_category(body, content_type):
@@ -136,9 +137,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _decypharr(self, method, body):
+    def _decypharr(self, method, body, path=None, content_type=None):
         headers = {k: v for k, v in self.headers.items() if k.lower() in ("cookie", "content-type", "authorization", "referer")}
-        req = urllib.request.Request(f"{DECYPHARR}{self.path}", data=body, method=method, headers=headers)
+        if content_type:
+            headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+            headers["Content-Type"] = content_type
+        req = urllib.request.Request(f"{DECYPHARR}{path or self.path}", data=body, method=method, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
                 hdrs = dict(r.headers)
@@ -156,6 +160,8 @@ class Handler(BaseHTTPRequestHandler):
         route = urllib.parse.urlsplit(self.path).path
 
         try:
+            if route == "/health":
+                return self._health()
             if route == "/api/v2/torrents/add":
                 return self._add(method, body, ctype)
             if route == "/api/v2/torrents/info":
@@ -179,8 +185,11 @@ class Handler(BaseHTTPRequestHandler):
             status, hdrs, resp, reason = 0, {}, b"", f"Decypharr unreachable: {e}"
         if 200 <= status < 300 and resp.strip() != b"Fails.":
             return self._send(status, hdrs, resp)
+        if status in (401, 403):
+            # bad credentials are a config error the *arr must see, not a reason to fall back
+            return self._send(status, hdrs, resp)
 
-        log.warning("Decypharr refused add (%s): %s -> falling back to qBittorrent", status, reason.strip())
+        log.warning("Decypharr refused add (%s): %s -> falling back to qBittorrent", status, " ".join(reason.split()))
         qbit.ensure_category(category_of(body or b"", ctype))
         qstatus, qhdrs, qresp = qbit.request(method, "/api/v2/torrents/add", rewrite_category(body or b"", ctype), {"Content-Type": ctype})
         if 200 <= qstatus < 300 and qresp.strip() != b"Fails.":
@@ -198,11 +207,58 @@ class Handler(BaseHTTPRequestHandler):
         items = json.loads(resp) if 200 <= status < 300 else []
         category = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(self.path).query)).get("category")
         try:
-            items += qbit.fallback_torrents(category)
+            fallback = qbit.fallback_torrents(category)
+            moved = {t["hash"].lower() for t in fallback}
+            kept = []
+            for t in items:
+                h = t.get("hash", "").lower()
+                if h in moved:
+                    continue  # already handed to qBittorrent; report that copy instead
+                if t.get("state") != "error":
+                    seen_working.add(h)
+                elif h in seen_working and self._move_to_qbit(t):
+                    # only torrents that failed while being tracked; stale leftovers stay put
+                    seen_working.discard(h)
+                    moved.add(h)
+                    continue
+                kept.append(t)
+            if moved - {t["hash"].lower() for t in fallback}:
+                fallback = qbit.fallback_torrents(category)
+            items = kept + fallback
         except Exception as e:
             log.warning("qBittorrent unreachable for info: %s", e)
         hdrs["Content-Type"] = "application/json"
         return self._send(200, hdrs, json.dumps(items).encode())
+
+    def _move_to_qbit(self, torrent):
+        """A torrent Decypharr accepted but then failed: restart it on qBittorrent by hash."""
+        h, cat = torrent["hash"].lower(), torrent.get("category", "")
+        qbit.ensure_category(cat)
+        form = urllib.parse.urlencode({
+            "urls": f"magnet:?xt=urn:btih:{h}&dn={urllib.parse.quote(torrent.get('name', h))}",
+            "category": cat + SUFFIX if cat else "",
+        }).encode()
+        status, _, resp = qbit.request("POST", "/api/v2/torrents/add", form, {"Content-Type": "application/x-www-form-urlencoded"})
+        if not 200 <= status < 300 or resp.strip() == b"Fails.":
+            log.error("could not move failed torrent %s to qBittorrent (%s): %s", torrent.get("name"), status, resp[:200])
+            return False
+        log.warning("Decypharr reports %s as failed -> restarted on qBittorrent", torrent.get("name", h))
+        self._decypharr("POST", urllib.parse.urlencode({"hashes": h, "deleteFiles": "true"}).encode(),
+                        "/api/v2/torrents/delete", "application/x-www-form-urlencoded")
+        return True
+
+    def _health(self):
+        """200 while this service runs; reports whether each backend answers."""
+        def reachable(fn):
+            try:
+                return fn()[0] < 500
+            except Exception:
+                return False
+        status = {
+            "decypharr": reachable(lambda: self._decypharr("GET", None, "/api/v2/app/version")),
+            "qbittorrent": reachable(lambda: qbit.request("GET", "/api/v2/app/version")),
+        }
+        return self._send(200, {"Content-Type": "application/json"}, json.dumps(status).encode())
 
     def do_GET(self):
         self._handle("GET")
@@ -211,7 +267,11 @@ class Handler(BaseHTTPRequestHandler):
         self._handle("POST")
 
 
+def serve(port, host="0.0.0.0"):
+    server = ThreadingHTTPServer((host, port), Handler)
+    log.info("decypharr-fallback on :%d  primary=%s  fallback=%s", server.server_port, DECYPHARR, QBIT)
+    return server
+
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8283"))
-    log.info("decypharr-fallback on :%d  primary=%s  fallback=%s", port, DECYPHARR, QBIT)
-    ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    serve(int(os.environ.get("PORT", "8283"))).serve_forever()
