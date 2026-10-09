@@ -1,0 +1,13 @@
+# Add this service next to your existing decypharr and qbittorrent services.
+# Then, in Radarr/Sonarr, edit the Decypharr download client and change its
+# host to "decypharr-fallback" and port to 8283. Nothing else changes.
+services:
+  decypharr-fallback:
+    build: https://github.com/zetawars/decypharr-fallback.git
+    container_name: decypharr-fallback
+    environment:
+      DECYPHARR_URL: http://decypharr:8282
+      QBIT_URL: http://qbittorrent:8080      # or http://gluetun:8080 if qBittorrent runs inside gluetun
+      QBIT_USERNAME: ${QBIT_USERNAME}
+      QBIT_PASSWORD: ${QBIT_PASSWORD}
+    restart: unless-stopped
